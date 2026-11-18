@@ -1949,7 +1949,20 @@ def createFrame(tag_header, frame_header, data):
         frame_header.unsync = True
 
     frame = FrameClass(fid)
-    frame.parse(data, frame_header)
+    try:
+        frame.parse(data, frame_header)
+    except FrameException:
+        raise
+    except Exception as parse_err:
+        # Frame-level corruption (undecodable text, truncated payloads,
+        # invalid compressed data, ...) must not abort parsing of the whole
+        # tag.  Normalize any parser failure into the frame exception family
+        # so FrameSet.parse can skip the corrupt frame and continue with the
+        # rest of the tag.
+        raise FrameException(
+            "Frame '%s' failed to parse (%s: %s)" %
+            (fid.decode("ascii", errors="replace"),
+             type(parse_err).__name__, parse_err)) from parse_err
     return frame
 
 
