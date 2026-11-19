@@ -627,6 +627,10 @@ class FrameHeader:
             # data_size corresponds to the size of the data segment after
             # encryption, compression, and unsynchronization.
             sz = f.read(3)
+            if len(sz) != 3:
+                core.parseError(FrameException(
+                    "FrameHeader: Truncated v2.2 frame size field: %r" % (sz,)))
+                return None
             frame_header.data_size = bin2dec(bytes2bin(sz, 8))
             log.debug("FrameHeader [data size]: %d (0x%X)" %
                       (frame_header.data_size, frame_header.data_size))
@@ -656,6 +660,14 @@ class FrameHeader:
             # data_size corresponds to the size of the data segment after
             # encryption, compression, and unsynchronization.
             sz = f.read(4)
+            if len(sz) != 4:
+                # The tag claims more bytes than the file holds; the frame
+                # header itself is truncated. Treat the rest as padding rather
+                # than parsing a partial header (which would read nonsense
+                # flags and raise).
+                core.parseError(FrameException(
+                    "FrameHeader: Truncated frame size field: %r" % (sz,)))
+                return None
             # In ID3 v2.4 this value became a synch-safe integer, meaning only
             # the low 7 bits are used per byte.
             if minor_version == 3:
@@ -667,6 +679,13 @@ class FrameHeader:
 
             # Frame flags.
             flags = f.read(2)
+            if len(flags) != 2:
+                # Same as above: a partial flag word must not be turned into a
+                # bit list and indexed (that is an IndexError in the flag
+                # accessors).
+                core.parseError(FrameException(
+                    "FrameHeader: Truncated frame flags: %r" % (flags,)))
+                return None
             frame_header._flags = bytes2bin(flags)
             if log.getEffectiveLevel() <= logging.DEBUG:
                 log.debug("FrameHeader [flags]: ta(%d) fa(%d) ro(%d) co(%d) "

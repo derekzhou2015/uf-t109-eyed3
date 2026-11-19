@@ -115,7 +115,12 @@ class Frame(object):
     def decompress(data):
         import zlib
         log.debug("before decompression: %d bytes" % len(data))
-        data = zlib.decompress(data, 15)
+        try:
+            data = zlib.decompress(data, 15)
+        except zlib.error as ex:
+            # The compression flag is set but the payload is not a valid zlib
+            # stream. This is frame damage, not a file-level failure.
+            raise FrameException(f"Unable to decompress frame data: {ex}")
         log.debug("after decompression: %d bytes" % len(data))
         return data
 
@@ -487,7 +492,10 @@ class UserUrlFrame(UrlFrame):
         # Calling Frame and NOT UrlFrame to get the basic disassemble behavior
         # UrlFrame would be confused by the encoding, desc, etc.
         super().parse(data, frame_header)
-        self.encoding = encoding = self.data[0:1]
+        # Use the coerced encoding (unknown bytes become latin1), not the raw
+        # encoding byte.
+        self.encoding = self.data[0:1]
+        encoding = self.encoding
 
         (d, u) = splitUnicode(self.data[1:], encoding)
         self.description = decodeUnicode(d, encoding)
@@ -606,7 +614,10 @@ class ImageFrame(Frame):
 
         input = BytesIO(self.data)
         log.debug("APIC frame data size: %d" % len(self.data))
-        self.encoding = encoding = input.read(1)
+        # The setter coerces an unrecognized encoding byte to latin1 (and logs
+        # a warning), so use self.encoding from here on, not the raw byte.
+        self.encoding = input.read(1)
+        encoding = self.encoding
 
         # Mime type
         self._mime_type = b""
@@ -626,7 +637,11 @@ class ImageFrame(Frame):
                 self._mime_type.find(b"/") == -1):
             self._mime_type = b"image/" + self._mime_type
 
-        pt = ord(input.read(1))
+        pt_byte = input.read(1)
+        if not pt_byte:
+            raise FrameException("APIC frame is truncated: missing picture "
+                                 "type byte")
+        pt = ord(pt_byte)
         log.debug("Initial APIC picture type: %d" % pt)
         if pt < self.MIN_TYPE or pt > self.MAX_TYPE:
             core.parseError(FrameException("Invalid APIC picture type: %d" %
@@ -649,8 +664,7 @@ class ImageFrame(Frame):
         if self._mime_type.find(self.URL_MIME_TYPE) != -1:
             self.image_data = None
             self.image_url = img
-            log.debug("APIC image URL: %s" %
-                      len(self.image_url.decode("ascii")))
+            log.debug("APIC image URL: %d bytes" % len(self.image_url))
         else:
             self.image_data = img
             self.image_url = None
@@ -837,7 +851,10 @@ class ObjectFrame(Frame):
 
         input = BytesIO(self.data)
         log.debug("GEOB frame data size: " + str(len(self.data)))
-        self.encoding = encoding = input.read(1)
+        # Use the coerced encoding (unknown bytes become latin1), not the raw
+        # encoding byte.
+        self.encoding = input.read(1)
+        encoding = self.encoding
 
         # Mime type
         self._mime_type = b""
@@ -1224,7 +1241,10 @@ class TermsOfUseFrame(Frame, LanguageCodeMixin):
     def parse(self, data, frame_header):
         super().parse(data, frame_header)
 
-        self.encoding = encoding = self.data[0:1]
+        # Use the coerced encoding (unknown bytes become latin1), not the raw
+        # encoding byte.
+        self.encoding = self.data[0:1]
+        encoding = self.encoding
         self.lang = self.data[1:4]
         log.debug("%s lang: %s" % (self.id, self.lang))
         self.text = decodeUnicode(self.data[4:], encoding)
@@ -1275,6 +1295,10 @@ class TocFrame(Frame):
         self.element_id = data[0:null_byte]
         data = data[null_byte + 1:]
 
+        if len(data) < 2:
+            # Need at least the flag byte and the entry-count byte.
+            raise FrameException("CTOC frame is truncated: missing flags "
+                                 "and/or entry count")
         flag_bits = bytes2bin(data[0:1])
         self.toplevel = bool(flag_bits[self.TOP_LEVEL_FLAG_BIT])
         self.ordered = bool(flag_bits[self.ORDERED_FLAG_BIT])
@@ -1295,9 +1319,20 @@ class TocFrame(Frame):
         elif data:
             data = BytesIO(data)
             frame_header = FrameHeader.parse(data, self.header.version)
+            if frame_header is None:
+                # The embedded description frame is itself unparseable;
+                # keep the TOC but drop just the description.
+                log.warning("Invalid toc data, embedded TIT2 header unparsable")
+                return
             data = data.read()
-            description_frame = TextFrame(TITLE_FID)
-            description_frame.parse(data, frame_header)
+            try:
+                description_frame = TextFrame(TITLE_FID)
+                description_frame.parse(data, frame_header)
+            except FrameException as ex:
+                # The TOC entries are intact; only the optional description is
+                # corrupt. Degrade rather than discard the whole TOC.
+                log.warning("Invalid toc data, embedded TIT2 unparsable: %s" % ex)
+                return
 
             self.description = description_frame.text
 
@@ -1391,10 +1426,19 @@ class RelVolAdjFrameV24(Frame):
 
         data = self.data
 
-        self.identifier, data = data.split(b"\x00", maxsplit=1)
-        if not data:
-            raise FrameException("Invalid frame data: no channel type")
-        self.channel_type = data[0]
+        try:
+            self.identifier, data = data.split(b"\x00", maxsplit=1)
+        except ValueError:
+            raise FrameException("RVA2 frame is truncated: no identifier "
+                                 "terminator")
+        if len(data) < 3:
+            # channel type (1) + 16-bit adjustment (2)
+            raise FrameException("RVA2 frame is truncated: missing channel "
+                                 "type and/or adjustment")
+        try:
+            self.channel_type = data[0]
+        except ValueError as ex:
+            raise FrameException(f"RVA2 frame has an invalid channel type: {ex}")
         self._adjustment = bytes2signedInt16(data[1:3])
         if len(data) > 3:
             bits_per_peak = data[3]
@@ -1573,6 +1617,9 @@ class RelVolAdjFrameV23(Frame):
         if self.header.version not in (ID3_V2_3, ID3_V2_2):
             raise FrameException("Invalid v2.4 frame: RVAD")
         data = self.data
+        if len(data) < 2:
+            raise FrameException("RVAD frame is truncated: missing inc/dec "
+                                 "bits and/or byte size")
 
         inc_dec_bit_list = bytes2bin(bytes([data[0]]))
         inc_dec_bit_list.reverse()
@@ -1948,8 +1995,31 @@ def createFrame(tag_header, frame_header, data):
     if tag_header.version[:2] == ID3_V2_4 and tag_header.unsync:
         frame_header.unsync = True
 
-    frame = FrameClass(fid)
-    frame.parse(data, frame_header)
+    try:
+        frame = FrameClass(fid)
+        frame.parse(data, frame_header)
+    except FrameException:
+        # The library's own frame-level error type; already the tolerant
+        # "skip this frame, keep going" signal for FrameSet.parse.
+        raise
+    except UnicodeDecodeError as ex:
+        # A string inside the frame is not valid for its declared encoding.
+        raise FrameException(f"Frame {fid!r} has invalid string data: {ex}")
+    except ValueError as ex:
+        # Explicit bounds/format checks (e.g. bad numeric fields) and split()
+        # unpack failures from truncated or underwritten delimited fields.
+        raise FrameException(f"Frame {fid!r} has invalid data: {ex}")
+    except (IndexError, NotImplementedError, TypeError) as ex:
+        # Truncated structures (indexing past the end), unknown encoding
+        # bytes, and wrong-type reads (e.g. ord(b"")). All are frame damage.
+        raise FrameException(f"Frame {fid!r} is malformed: {type(ex).__name__}: {ex}")
+    except Exception as ex:
+        # Final backstop (also catches struct.error and anything unforeseen):
+        # no single frame's failure may escape as anything other than
+        # FrameException, so bulk imports keep going. This covers construction
+        # as well as parsing; a frame whose constructor rejects the ID is
+        # itself malformed.
+        raise FrameException(f"Frame {fid!r} failed to parse: {type(ex).__name__}: {ex}")
     return frame
 
 
