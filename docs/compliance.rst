@@ -12,6 +12,42 @@ Unsupported Features
 * Writing of sync-safe data (i.e. unsynchronized) because it is 2012.
   Reading of unsyncronized tags (v2.3) and frames (v2.4) **is** supported.
 
+Corrupt Data Tolerance
+----------------------
+Data read from files is arbitrary and may be damaged. eyeD3 confines such
+damage to the smallest unit it can be attributed to, and never lets one bad
+unit end the read of a larger one.
+
+* **Frames.** A frame that cannot be parsed is dropped on its own. The failure
+  is normalized to :class:`eyed3.id3.frames.FrameException` (the library's
+  frame-level error type), logged as a warning, and the frame IDs involved are
+  exposed as :attr:`eyed3.id3.frames.FrameSet.corrupt_frame_ids`. Frames
+  before and after its position, including other frames sharing the same ID,
+  are parsed normally. A corrupt frame is *not* reported as ``unknown`` (see
+  :attr:`eyed3.id3.frames.FrameSet.unknown_frame_ids`); "unknown" means a
+  well-formed frame eyeD3 has no class for, while "corrupt" means the bytes
+  did not parse.
+
+  This does not narrow existing tolerance: frames whose values are merely
+  invalid (bad dates, unknown text encodings, empty picture types, unknown
+  frame IDs, ...) continue to be accepted--possibly repaired with a warning--
+  exactly as before. Only a frame whose parsing could not complete is dropped.
+
+* **Tag envelope.** A malformed tag or extended header is reported as
+  :class:`eyed3.id3.tag.TagException`. A tag whose declared size is smaller
+  than its own extended header is treated as an empty frame area rather than
+  a failure.
+
+* **Audio data.** MPEG audio info is computed on a best-effort basis. A
+  corrupt, truncated, or entirely absent MPEG frame yields
+  ``AudioFile.info is None`` (with a warning); it does not prevent the tag
+  from being read or the file from loading.
+
+Batch callers (e.g. importing a library) therefore lose at most the corrupt
+frame, and a file with a valid tag still loads even when its audio data is
+damaged.
+
+
 Dates
 -----
 One of the major differences between 2.3 and 2.4 is dates.

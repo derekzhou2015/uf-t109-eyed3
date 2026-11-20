@@ -24,6 +24,31 @@ class FrameException(Error):
     pass
 
 
+def _frameParseError(fid, ex):
+    """Normalize ``ex``, raised while parsing the single frame ``fid``, into a
+    :class:`FrameException`.
+
+    Frame bytes come from arbitrary files and may be corrupt in ways no frame
+    implementation anticipated (short reads, bad compressed data, invalid
+    nesting, ...).  Such failures are all frame-level conditions, so the
+    library reports them with one type and callers can drop just that frame.
+    An exception that is already a ``FrameException`` is returned unchanged.
+    """
+    if isinstance(ex, FrameException):
+        return ex
+
+    try:
+        frame_id = fid.decode("ascii", "replace")
+    except Exception:  # pragma: nocover - defensive, fid is always bytes
+        frame_id = repr(fid)
+
+    err = FrameException(
+        f"Frame {frame_id!r} is corrupt and was ignored: "
+        f"{type(ex).__name__}: {ex}")
+    err.__cause__ = ex
+    return err
+
+
 TITLE_FID          = b"TIT2"                                            # noqa
 SUBTITLE_FID       = b"TIT3"                                            # noqa
 ARTIST_FID         = b"TPE1"                                            # noqa
@@ -1778,6 +1803,7 @@ class FrameSet(dict):
     def __init__(self):
         dict.__init__(self)
         self._unknown_frame_ids = set()
+        self._corrupt_frame_ids = set()
 
     def parse(self, f, tag_header, extended_header):
         """Read frames starting from the current read position of the file
@@ -1785,9 +1811,18 @@ class FrameSet(dict):
         before the audio content.  A return value of 0 does not mean error."""
         self.clear()
         self._unknown_frame_ids.clear()
+        self._corrupt_frame_ids.clear()
 
         padding_size = 0
         size_left = tag_header.tag_size - extended_header.size
+        if size_left < 0:
+            # The tag header claims less data than the extended header alone
+            # consumed. There is nothing left to read; treat the (malformed)
+            # envelope as an empty frame area rather than failing the file.
+            log.warning("Tag size (%d) is smaller than its extended header "
+                        "(%d); no frames to read" %
+                        (tag_header.tag_size, extended_header.size))
+            size_left = 0
         consumed_size = 0
 
         # Handle a tag-level unsync.  Some frames may have their own unsync bit
@@ -1843,8 +1878,15 @@ class FrameSet(dict):
                                   frame_header.data_size)
                 try:
                     frame = createFrame(tag_header, frame_header, data)
-                except FrameException as frame_ex:
-                    log.warning(f"Frame error:  {frame_ex}")
+                except Exception as frame_ex:
+                    # A single frame failing to parse is a frame-level
+                    # condition; the rest of the tag (and file) is unaffected.
+                    # Normalize to the library's frame-error type, record it,
+                    # and move on to the next frame instead of abandoning the
+                    # whole tag.
+                    frame_error = _frameParseError(frame_header.id, frame_ex)
+                    self._corrupt_frame_ids.add(frame_header.id)
+                    log.warning(f"Frame error:  {frame_error}")
                 else:
                     self[frame.id] = frame
                     frame_count += 1
@@ -1877,6 +1919,15 @@ class FrameSet(dict):
     @property
     def unknown_frame_ids(self):
         return self._unknown_frame_ids
+
+    @property
+    def corrupt_frame_ids(self):
+        """The frame IDs that were present in the tag but could not be parsed.
+
+        A corrupt frame is dropped (it is not in this set as a frame, nor in
+        :attr:`unknown_frame_ids`) and the rest of the tag is parsed as usual.
+        """
+        return set(self._corrupt_frame_ids)
 
     def getAllFrames(self):
         """Return all the frames in the set as a list. The list is sorted

@@ -168,14 +168,21 @@ class LoaderPlugin(Plugin):
         :class:`eyed3.core.AudioFile` or ``None`` if an error occurred or the
         file is not a recognized type.
 
+        A file that cannot be loaded (e.g. an unsupported or malformed tag
+        envelope) is reported and skipped so that a walk over many files
+        continues; it does not end the batch.
+
         The ``*args`` and ``**kwargs`` are passed to :func:`eyed3.core.load`.
         """
+        from eyed3.id3.tag import TagException
 
         try:
             self.audio_file = core.load(f, *args, **kwargs)
-        except NotImplementedError as ex:
-            # Frame decryption, for instance...
-            printError(str(ex))
+        except (NotImplementedError, TagException) as ex:
+            # Frame decryption, an unsupported tag version, or a malformed
+            # tag envelope: this file is skipped, the rest are still handled.
+            printError(f"{f}: {ex}")
+            self.audio_file = None
             return
 
         if self.audio_file:

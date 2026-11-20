@@ -167,6 +167,15 @@ class Mp3AudioFile(core.AudioFile):
                 # the tag.
                 log.warning(ex)
                 self._info = None
+            except Exception as ex:
+                # Audio info is best effort. A corrupt/truncated MPEG frame
+                # (or a file too short to hold one) must not make a file
+                # unreadable when its tag parsed fine, so this is downgraded
+                # to the same "no audio info" outcome as Mp3Exception above.
+                log.warning(Mp3Exception(
+                    f"Corrupt mp3 data in '{self.path}': "
+                    f"{type(ex).__name__}: {ex}"))
+                self._info = None
 
             self.type = core.AUDIO_MP3
 

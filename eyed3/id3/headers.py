@@ -386,21 +386,32 @@ class ExtendedTagHeader(object):
         from .tag import TagException
         assert version[0] == 2
 
+        def malformed(why):
+            return TagException(f"Invalid Extended Header: {why}")
+
         log.debug("Parsing extended header @ 0x%x" % fp.tell())
         # First 4 bytes is the size of the extended header.
         data = fp.read(4)
+        if len(data) != 4:
+            raise malformed("truncated size field")
         if version[1] == 4:
             # sync-safe
             sz = bin2dec(bytes2bin(data, 7))
+            if sz < 6:
+                # The size includes these 4 bytes and at least one flag byte
+                # plus the flags byte itself.
+                raise malformed(f"size {sz} is too small")
             self.size = sz
             log.debug("Extended header size (includes the 4 size bytes): %d" % sz)
             data = fp.read(sz - 4)
+            if len(data) != sz - 4:
+                raise malformed("truncated data")
 
             # Number of flag bytes
-            if data[0] != 1 or (data[1] & 0x8f):
+            if len(data) < 2 or data[0] != 1 or (data[1] & 0x8f):
                 # As of 2.4 the first byte is 1 and the second can only have
                 # bits 6, 5, and 4 set.
-                raise TagException("Invalid Extended Header")
+                raise malformed("invalid flag bytes")
 
             self._flags = data[1]
             log.debug("Extended header flags: %x" % self._flags)
@@ -408,21 +419,28 @@ class ExtendedTagHeader(object):
             offset = 2
             if self.update_bit:
                 log.debug("Extended header has update bit set")
-                assert data[offset] == 0
+                if data[offset:offset + 1] != b"\x00":
+                    raise malformed("update flag data")
                 offset += 1
             if self.crc_bit:
                 log.debug("Extended header has CRC bit set")
-                assert data[offset] == 5
+                if data[offset:offset + 1] != b"\x05":
+                    raise malformed("CRC flag data")
                 offset += 1
                 crc_data = data[offset:offset + 5]
+                if len(crc_data) != 5:
+                    raise malformed("truncated CRC")
                 # This is sync-safe.
                 self.crc = bin2dec(bytes2bin(crc_data, 7))
                 log.debug("Extended header CRC: %d" % self.crc)
                 offset += 5
             if self.restrictions_bit:
                 log.debug("Extended header has restrictions bit set")
-                assert data[offset] == 1
+                if data[offset:offset + 1] != b"\x01":
+                    raise malformed("restrictions flag data")
                 offset += 1
+                if len(data[offset:offset + 1]) != 1:
+                    raise malformed("truncated restrictions")
                 self._restrictions = data[offset]
                 offset += 1
         else:
@@ -432,8 +450,12 @@ class ExtendedTagHeader(object):
             log.debug("Extended header size (not including 4 size bytes): %d" %
                       sz)
             tmpFlags = fp.read(2)
+            if len(tmpFlags) != 2:
+                raise malformed("truncated flags")
             # Read the padding size, but it'll be computed during the parse.
             ps = fp.read(4)
+            if len(ps) != 4:
+                raise malformed("truncated padding size")
             log.debug("Extended header says there is %d bytes of padding" %
                       bin2dec(bytes2bin(ps)))
             # Make this look like a v2.4 mask.
@@ -441,6 +463,8 @@ class ExtendedTagHeader(object):
             if self.crc_bit:
                 log.debug("Extended header has CRC bit set")
                 crc_data = fp.read(4)
+                if len(crc_data) != 4:
+                    raise malformed("truncated CRC")
                 self.crc = bin2dec(bytes2bin(crc_data))
                 log.debug("Extended header CRC: %d" % self.crc)
 
